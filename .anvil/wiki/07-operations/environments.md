@@ -13,6 +13,7 @@ Obligatoires:
 Optionnelle:
 
 - `IP_DNS` (défaut `orny`)
+- `BTP_API_KEY_0`, `BTP_API_KEY_1` (ou `BTP_API_KEY` en fallback) — requis pour `/say` et `/start` (API REST BoxToPlay v1, une clé par compte, même ordre que le Gist)
 
 Source: [`index.js`](../../../../index.js).
 
