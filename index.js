@@ -791,6 +791,26 @@ async function btpSendConsoleCommand(apiKey, apiId, command) {
 
 const SAY_MESSAGE_MAX_LENGTH = 256;
 
+// Blurple Discord, pour que le prefixe se lise comme "ca vient du Discord".
+const DISCORD_BLURPLE = '#5865F2';
+
+/**
+ * Construit la commande console qui relaie un message Discord dans le chat.
+ *
+ * `say` est ecarte: envoye depuis la console distante, le serveur le prefixe
+ * lui-meme d'un `[Rcon]` qu'on ne peut pas retirer. `tellraw` rend exactement
+ * les composants qu'on lui donne, et JSON.stringify echappe le texte
+ * utilisateur (guillemets, antislashs) au passage.
+ */
+function buildChatRelayCommand(author, message) {
+    const components = [
+        { text: '[Discord] ', color: DISCORD_BLURPLE },
+        { text: `<${author}> `, color: 'aqua' },
+        { text: message, color: 'white' },
+    ];
+    return `tellraw @a ${JSON.stringify(components)}`;
+}
+
 /**
  * Neutralise les retours ligne / caracteres de controle et valide la
  * longueur avant d'injecter le message dans une commande console. Un `\n`
@@ -1679,8 +1699,7 @@ client.on('interactionCreate', async interaction => {
             const apiId = await resolveBtpApiServerId(apiKey, serverId);
             const author = interaction.member?.displayName || interaction.user.username;
             const safeMessage = sanitizeChatMessage(message);
-            // Format "say" Minecraft standard: /say <auteur>: <message>
-            const command = `say ${author}: ${safeMessage}`;
+            const command = buildChatRelayCommand(author, safeMessage);
             await btpSendConsoleCommand(apiKey, apiId, command);
             return interaction.editReply({
                 content: `✅ Message envoye dans le chat: **${author}**: ${safeMessage}`,
