@@ -784,6 +784,28 @@ async function btpSendConsoleCommand(apiKey, apiId, command) {
     });
 }
 
+const SAY_MESSAGE_MAX_LENGTH = 256;
+
+/**
+ * Neutralise les retours ligne / caracteres de controle et valide la
+ * longueur avant d'injecter le message dans une commande console. Un `\n`
+ * dans la commande pourrait etre interprete comme un separateur de commande
+ * par l'API ou le serveur (injection de commande via /say).
+ */
+function sanitizeChatMessage(raw) {
+    const cleaned = String(raw)
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\x00-\x1F\x7F]+/g, ' ')
+        .trim();
+    if (!cleaned) {
+        throw new Error('Message vide apres nettoyage.');
+    }
+    if (cleaned.length > SAY_MESSAGE_MAX_LENGTH) {
+        throw new Error(`Message trop long (max ${SAY_MESSAGE_MAX_LENGTH} caracteres).`);
+    }
+    return cleaned;
+}
+
 async function checkAccount(account, index) {
     if (!account.cookies[SESSION_COOKIE_KEY]) {
         log('WARN', 'KeepAlive', `Skip ${account.email} (pas de cookie de session)`);
@@ -1651,13 +1673,20 @@ client.on('interactionCreate', async interaction => {
         try {
             const apiId = await resolveBtpApiServerId(apiKey, serverId);
             const author = interaction.member?.displayName || interaction.user.username;
+            const safeMessage = sanitizeChatMessage(message);
             // Format "say" Minecraft standard: /say <auteur>: <message>
-            const command = `say ${author}: ${message}`;
+            const command = `say ${author}: ${safeMessage}`;
             await btpSendConsoleCommand(apiKey, apiId, command);
-            return interaction.editReply(`✅ Message envoye dans le chat: **${author}**: ${message}`);
+            return interaction.editReply({
+                content: `✅ Message envoye dans le chat: **${author}**: ${safeMessage}`,
+                allowedMentions: { parse: [] },
+            });
         } catch (error) {
             log('ERROR', 'Say', `Erreur: ${error.message}`);
-            return interaction.editReply(`❌ Impossible d'envoyer le message: ${error.message}`);
+            return interaction.editReply({
+                content: `❌ Impossible d'envoyer le message: ${error.message}`,
+                allowedMentions: { parse: [] },
+            });
         }
     }
 
@@ -1690,12 +1719,22 @@ client.on('interactionCreate', async interaction => {
             if (currentStatus === 'starting') {
                 return interaction.editReply('⏳ Le serveur est deja en cours de demarrage.');
             }
+            // Ne demarrer que depuis un etat explicitement a l'arret. Les
+            // statuts transitoires/inconnus (stopping, deleting, installing,
+            // unknown) ne doivent pas declencher de start: risque de start
+            // inutile, d'erreur API, ou d'UX confus.
+            if (currentStatus !== 'stopped') {
+                return interaction.editReply(`⚠️ Le serveur est dans un etat transitoire (\`${currentStatus}\`), reessaie dans quelques instants.`);
+            }
 
             await btpStartServer(apiKey, apiId);
             return interaction.editReply('🚀 Demarrage du serveur lance ! Ca peut prendre 1 a 2 minutes, utilise `/status` pour verifier.');
         } catch (error) {
             log('ERROR', 'Start', `Erreur: ${error.message}`);
-            return interaction.editReply(`❌ Impossible de demarrer le serveur: ${error.message}`);
+            return interaction.editReply({
+                content: `❌ Impossible de demarrer le serveur: ${error.message}`,
+                allowedMentions: { parse: [] },
+            });
         }
     }
 });
