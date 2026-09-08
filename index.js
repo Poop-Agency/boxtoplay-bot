@@ -744,12 +744,16 @@ async function btpApiRequest(method, path, apiKey, options = {}) {
         timeout: options.timeout || FETCH_TIMEOUT_MS,
         validateStatus: null,
     });
-    if (response.status >= 400) {
-        const body = response.data;
+    // L'API repond toujours dans une enveloppe {success, request_id, data}.
+    // Un echec peut arriver en HTTP 200 avec success:false, donc les deux
+    // conditions doivent etre testees (cf. btp_api.py::_unwrap cote v2).
+    const body = response.data;
+    if (response.status >= 400 || body?.success === false) {
         const message = body?.error?.message || body?.message || `HTTP ${response.status}`;
-        throw new Error(message);
+        const details = body?.error?.details ? ` (${JSON.stringify(body.error.details)})` : '';
+        throw new Error(`${message}${details}`);
     }
-    return response.data;
+    return body?.data ?? body;
 }
 
 /**
@@ -758,8 +762,9 @@ async function btpApiRequest(method, path, apiKey, options = {}) {
  */
 async function resolveBtpApiServerId(apiKey, panelServerId) {
     if (String(panelServerId).startsWith('btp_')) return panelServerId;
+    // limit max cote API = 50 (au dela: HTTP 400 api.validation.invalid_request).
     const data = await btpApiRequest('GET', '/services/minecraft', apiKey, {
-        params: { limit: 100 },
+        params: { limit: 50 },
     });
     const services = data?.services || data?.items || [];
     const match = services.find(s => String(s.display_id) === String(panelServerId));
