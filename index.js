@@ -719,6 +719,93 @@ async function btpApiFetch(url, cookieHeader) {
 }
 const BROWSER_CLOSE_TIMEOUT_MS = 5000; // 5s timeout for browser.close()
 
+// ==========================================
+// API BTP OFFICIELLE (v1) — /say et /start
+// ==========================================
+// Meme API REST que boxtoplay-v2 (btp_api.py): une cle par compte, dans
+// l'ordre du Gist (BTP_API_KEY_0/1), avec fallback BTP_API_KEY.
+const BTP_API_BASE = process.env.BTP_API_BASE || 'https://api.boxtoplay.com/v1';
+
+function getBtpApiKey(accountIndex) {
+    return process.env[`BTP_API_KEY_${accountIndex}`] || process.env.BTP_API_KEY || null;
+}
+
+async function btpApiRequest(method, path, apiKey, options = {}) {
+    const response = await axios({
+        method,
+        url: `${BTP_API_BASE}${path}`,
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: 'application/json',
+            'User-Agent': 'boxtoplay-bot/1.0',
+        },
+        params: options.params,
+        data: options.json,
+        timeout: options.timeout || FETCH_TIMEOUT_MS,
+        validateStatus: null,
+    });
+    if (response.status >= 400) {
+        const body = response.data;
+        const message = body?.error?.message || body?.message || `HTTP ${response.status}`;
+        throw new Error(message);
+    }
+    return response.data;
+}
+
+/**
+ * Traduit un numero panel (stocke dans le Gist) en id API (`btp_...`).
+ * Passe-plat si deja un id API. Meme logique que rest_ops.py::_api_id.
+ */
+async function resolveBtpApiServerId(apiKey, panelServerId) {
+    if (String(panelServerId).startsWith('btp_')) return panelServerId;
+    const data = await btpApiRequest('GET', '/services/minecraft', apiKey, {
+        params: { limit: 100 },
+    });
+    const services = data?.services || data?.items || [];
+    const match = services.find(s => String(s.display_id) === String(panelServerId));
+    if (!match) {
+        throw new Error(`Serveur #${panelServerId} introuvable via l'API BTP.`);
+    }
+    return match.id;
+}
+
+async function btpRuntimeStatus(apiKey, apiId) {
+    const data = await btpApiRequest('GET', `/services/minecraft/${apiId}/status`, apiKey);
+    return data?.runtime_status;
+}
+
+async function btpStartServer(apiKey, apiId) {
+    return btpApiRequest('POST', `/services/minecraft/${apiId}/start`, apiKey);
+}
+
+async function btpSendConsoleCommand(apiKey, apiId, command) {
+    return btpApiRequest('POST', `/services/minecraft/${apiId}/console/commands`, apiKey, {
+        json: { command },
+    });
+}
+
+const SAY_MESSAGE_MAX_LENGTH = 256;
+
+/**
+ * Neutralise les retours ligne / caracteres de controle et valide la
+ * longueur avant d'injecter le message dans une commande console. Un `\n`
+ * dans la commande pourrait etre interprete comme un separateur de commande
+ * par l'API ou le serveur (injection de commande via /say).
+ */
+function sanitizeChatMessage(raw) {
+    const cleaned = String(raw)
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\x00-\x1F\x7F]+/g, ' ')
+        .trim();
+    if (!cleaned) {
+        throw new Error('Message vide apres nettoyage.');
+    }
+    if (cleaned.length > SAY_MESSAGE_MAX_LENGTH) {
+        throw new Error(`Message trop long (max ${SAY_MESSAGE_MAX_LENGTH} caracteres).`);
+    }
+    return cleaned;
+}
+
 async function checkAccount(account, index) {
     if (!account.cookies[SESSION_COOKIE_KEY]) {
         log('WARN', 'KeepAlive', `Skip ${account.email} (pas de cookie de session)`);
@@ -903,6 +990,9 @@ const commands = [
     new SlashCommandBuilder().setName('rotate').setDescription('Declenche la rotation via GitHub Actions')
         .addBooleanOption(o => o.setName('force').setDescription('Forcer meme si le serveur est jeune et en ligne')),
     new SlashCommandBuilder().setName('time').setDescription('Classement des temps de jeu des joueurs'),
+    new SlashCommandBuilder().setName('say').setDescription('Envoie un message dans le chat du serveur Minecraft')
+        .addStringOption(o => o.setName('message').setDescription('Message a envoyer').setRequired(true)),
+    new SlashCommandBuilder().setName('start').setDescription('Demarre le serveur Minecraft s\'il est arrete'),
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -1557,6 +1647,94 @@ client.on('interactionCreate', async interaction => {
         } catch (error) {
             log('ERROR', 'Time', `Erreur: ${error.message}`);
             return interaction.editReply(`❌ Erreur lors de la recuperation des temps de jeu: ${error.message}`);
+        }
+    }
+
+    // --- /say ---
+    if (commandName === 'say') {
+        await interaction.deferReply();
+
+        if (!LOCAL_STATE) {
+            return interaction.editReply('❌ State non charge. Reessayez dans quelques secondes.');
+        }
+
+        const message = interaction.options.getString('message', true);
+        const activeIndex = LOCAL_STATE.active_account_index;
+        const serverId = LOCAL_STATE.current_server_id;
+        const apiKey = getBtpApiKey(activeIndex);
+
+        if (!serverId) {
+            return interaction.editReply('❌ Aucun serveur actif connu (state incomplet).');
+        }
+        if (!apiKey) {
+            return interaction.editReply(`❌ Cle API BTP manquante pour le compte actif (BTP_API_KEY_${activeIndex}).`);
+        }
+
+        try {
+            const apiId = await resolveBtpApiServerId(apiKey, serverId);
+            const author = interaction.member?.displayName || interaction.user.username;
+            const safeMessage = sanitizeChatMessage(message);
+            // Format "say" Minecraft standard: /say <auteur>: <message>
+            const command = `say ${author}: ${safeMessage}`;
+            await btpSendConsoleCommand(apiKey, apiId, command);
+            return interaction.editReply({
+                content: `✅ Message envoye dans le chat: **${author}**: ${safeMessage}`,
+                allowedMentions: { parse: [] },
+            });
+        } catch (error) {
+            log('ERROR', 'Say', `Erreur: ${error.message}`);
+            return interaction.editReply({
+                content: `❌ Impossible d'envoyer le message: ${error.message}`,
+                allowedMentions: { parse: [] },
+            });
+        }
+    }
+
+    // --- /start ---
+    if (commandName === 'start') {
+        await interaction.deferReply();
+
+        if (!LOCAL_STATE) {
+            return interaction.editReply('❌ State non charge. Reessayez dans quelques secondes.');
+        }
+
+        const activeIndex = LOCAL_STATE.active_account_index;
+        const serverId = LOCAL_STATE.current_server_id;
+        const apiKey = getBtpApiKey(activeIndex);
+
+        if (!serverId) {
+            return interaction.editReply('❌ Aucun serveur actif connu (state incomplet).');
+        }
+        if (!apiKey) {
+            return interaction.editReply(`❌ Cle API BTP manquante pour le compte actif (BTP_API_KEY_${activeIndex}).`);
+        }
+
+        try {
+            const apiId = await resolveBtpApiServerId(apiKey, serverId);
+            const currentStatus = await btpRuntimeStatus(apiKey, apiId);
+
+            if (currentStatus === 'started') {
+                return interaction.editReply('ℹ️ Le serveur est deja demarre.');
+            }
+            if (currentStatus === 'starting') {
+                return interaction.editReply('⏳ Le serveur est deja en cours de demarrage.');
+            }
+            // Ne demarrer que depuis un etat explicitement a l'arret. Les
+            // statuts transitoires/inconnus (stopping, deleting, installing,
+            // unknown) ne doivent pas declencher de start: risque de start
+            // inutile, d'erreur API, ou d'UX confus.
+            if (currentStatus !== 'stopped') {
+                return interaction.editReply(`⚠️ Le serveur est dans un etat transitoire (\`${currentStatus}\`), reessaie dans quelques instants.`);
+            }
+
+            await btpStartServer(apiKey, apiId);
+            return interaction.editReply('🚀 Demarrage du serveur lance ! Ca peut prendre 1 a 2 minutes, utilise `/status` pour verifier.');
+        } catch (error) {
+            log('ERROR', 'Start', `Erreur: ${error.message}`);
+            return interaction.editReply({
+                content: `❌ Impossible de demarrer le serveur: ${error.message}`,
+                allowedMentions: { parse: [] },
+            });
         }
     }
 });
