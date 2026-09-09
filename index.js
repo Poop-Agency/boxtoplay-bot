@@ -1085,7 +1085,9 @@ async function updatePresence() {
         if (isOnline) {
             statusIcon = '🟢';
             memoryGo = Number(metrics?.memory_usage_mb || 0) / 1000;
-            cpuPercent = Number(metrics?.cpu_usage_percent || metrics?.display_cpu_usage_percent || 0);
+            // display_cpu_usage_percent = cpu_usage_percent deja normalise sur cpu_threads
+            // par l'API (ex: 90/32 threads -> 3), c'est celui qu'affiche le panel BTP.
+            cpuPercent = Math.round(Number(metrics?.display_cpu_usage_percent ?? 0));
         }
 
         statusMessage = `${statusIcon} | 👥 ${onlinePlayers} | 🧠 ${memoryGo.toFixed(2)} Go | ⚙️ ${cpuPercent}%`;
