@@ -41,6 +41,10 @@ let cachedStats = {
     lastUpdated: 0
 };
 
+// Cache de l'id API BTP resolu (evite un GET /services/minecraft a chaque poll de presence)
+let cachedBtpApiId = null;
+let cachedBtpApiIdServerId = null;
+
 const TIMINGS = {
     CLOUDFLARE_TIMEOUT: 30000,
     CLOUDFLARE_SETTLE_DELAY: 3000,
@@ -48,7 +52,7 @@ const TIMINGS = {
     PAGE_LOAD_TIMEOUT: 60000,
     CHROME_INSTALL_TIMEOUT: 180000,
     INTER_ACCOUNT_DELAY: 3000,
-    PRESENCE_INTERVAL: 60 * 1000,
+    PRESENCE_INTERVAL: 7 * 1000, // Discord gateway limite ~5 presence updates/20s, 7s reste large en dessous
     KEEPALIVE_INTERVAL: 10 * 60 * 1000, // 10 minutes to save CPU/RAM on Render
 };
 
@@ -774,6 +778,16 @@ async function resolveBtpApiServerId(apiKey, panelServerId) {
     return match.id;
 }
 
+async function getCachedBtpApiId(apiKey, panelServerId) {
+    if (cachedBtpApiId && cachedBtpApiIdServerId === panelServerId) {
+        return cachedBtpApiId;
+    }
+    const apiId = await resolveBtpApiServerId(apiKey, panelServerId);
+    cachedBtpApiId = apiId;
+    cachedBtpApiIdServerId = panelServerId;
+    return apiId;
+}
+
 async function btpRuntimeStatus(apiKey, apiId) {
     const data = await btpApiRequest('GET', `/services/minecraft/${apiId}/status`, apiKey);
     return data?.runtime_status;
@@ -781,6 +795,30 @@ async function btpRuntimeStatus(apiKey, apiId) {
 
 async function btpStartServer(apiKey, apiId) {
     return btpApiRequest('POST', `/services/minecraft/${apiId}/start`, apiKey);
+}
+
+// Reste "hooke" apres /start: poll runtime_status jusqu'a 'started' puis previent
+// via followUp (le start prend generalement ~2min, marge large a 5min).
+async function pollStartConfirmation(interaction, apiKey, apiId) {
+    const POLL_INTERVAL_MS = 10_000;
+    const MAX_WAIT_MS = 5 * 60 * 1000;
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < MAX_WAIT_MS) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        let status;
+        try {
+            status = await btpRuntimeStatus(apiKey, apiId);
+        } catch (err) {
+            log('WARN', 'Start', `Poll runtime_status echoue, on reessaie: ${err.message}`);
+            continue;
+        }
+        if (status === 'started') {
+            const elapsedS = Math.round((Date.now() - startedAt) / 1000);
+            return interaction.followUp(`✅ Serveur demarre et pret (${elapsedS}s).`);
+        }
+    }
+    return interaction.followUp('⚠️ Toujours pas demarre apres 5 minutes, verifie `/status`.');
 }
 
 async function btpSendConsoleCommand(apiKey, apiId, command) {
@@ -1061,16 +1099,28 @@ async function updatePresence() {
         const account = LOCAL_STATE.accounts[activeIndex];
         const serverId = LOCAL_STATE.current_server_id;
 
-        // Recuperer le statut MC via l'API publique mcsrvstat (pas de Cloudflare block)
+        // Nombre de joueurs: l'API BTP ne l'expose pas, on garde mcsrvstat (pas de Cloudflare block)
         const mcStatus = await fetchMcStatus();
 
         if (!mcStatus) {
             throw new Error('Impossible de joindre le serveur (API indisponible)');
         }
 
-        const isOnline = mcStatus.online;
+        // Online/offline: via l'API BTP officielle (runtime_status fait foi, cf. rest_ops.py
+        // cote v2), avec repli sur mcsrvstat si la cle API manque ou que l'appel echoue.
+        let isOnline = mcStatus.online;
+        const apiKey = getBtpApiKey(activeIndex);
+        if (apiKey) {
+            try {
+                const apiId = await getCachedBtpApiId(apiKey, serverId);
+                const runtimeStatus = await btpRuntimeStatus(apiKey, apiId);
+                isOnline = runtimeStatus === 'started';
+            } catch (btpErr) {
+                log('WARN', 'Presence', `Statut BTP indisponible, repli mcsrvstat: ${btpErr.message}`);
+            }
+        }
         const onlinePlayers = mcStatus.players?.online ?? 0;
-        
+
         let statusIcon = '🔴';
         let memoryGo = 0;
         let cpuPercent = 0;
@@ -1752,7 +1802,9 @@ client.on('interactionCreate', async interaction => {
             }
 
             await btpStartServer(apiKey, apiId);
-            return interaction.editReply('🚀 Demarrage du serveur lance ! Ca peut prendre 1 a 2 minutes, utilise `/status` pour verifier.');
+            pollStartConfirmation(interaction, apiKey, apiId).catch(err =>
+                log('WARN', 'Start', `Poll confirmation echoue: ${err.message}`));
+            return interaction.editReply('🚀 Demarrage du serveur lance ! Ca prend generalement 1 a 2 minutes, je previens des que c\'est pret.');
         } catch (error) {
             log('ERROR', 'Start', `Erreur: ${error.message}`);
             return interaction.editReply({
