@@ -15,8 +15,6 @@ const URLS = {
     BOXTOPLAY_PANEL: 'https://www.boxtoplay.com/panel',
     BOXTOPLAY_STATUS: (serverId) => `https://www.boxtoplay.com/minecraft/getStatus/${serverId}`,
     BOXTOPLAY_ONLINE_PLAYERS: (serverId) => `https://www.boxtoplay.com/minecraft/getOnlinePlayers/${serverId}`,
-    BOXTOPLAY_MEMORY_USAGE: (serverId) => `https://www.boxtoplay.com/minecraft/getMcMemUsage/${serverId}`,
-    BOXTOPLAY_CPU_USAGE: (serverId) => `https://www.boxtoplay.com/minecraft/getMcCpuUsagePercent/${serverId}`,
     GITHUB_GIST: (gistId) => `https://api.github.com/gists/${gistId}`,
     GITHUB_ACTION_DISPATCH: (repo) => `https://api.github.com/repos/${repo}/actions/workflows/schedule.yml/dispatches`,
     MC_STATUS: (dns) => `https://api.mcsrvstat.us/3/${dns}.boxtoplay.com`,
@@ -33,13 +31,6 @@ const RELEVANT_COOKIE_NAMES = [
 ];
 const SESSION_COOKIE_KEY = 'BOXTOPLAY_SESSION';
 let statusMessage = '🔴 | 👥 0 | 🧠 0.00 Go | ⚙️ 0%';
-
-// Global stats cache (refreshed via Puppeteer during KeepAlive cycles)
-let cachedStats = {
-    memoryUsage: '0',
-    cpuUsage: '0',
-    lastUpdated: 0
-};
 
 // Cache de l'id API BTP resolu (evite un GET /services/minecraft a chaque poll de presence)
 let cachedBtpApiId = null;
@@ -793,6 +784,10 @@ async function btpRuntimeStatus(apiKey, apiId) {
     return data?.runtime_status;
 }
 
+async function btpMetrics(apiKey, apiId) {
+    return btpApiRequest('GET', `/services/minecraft/${apiId}/metrics`, apiKey);
+}
+
 async function btpStartServer(apiKey, apiId) {
     return btpApiRequest('POST', `/services/minecraft/${apiId}/start`, apiKey);
 }
@@ -922,37 +917,6 @@ async function refreshCookiesWithBrowser(account, index) {
         await extractAndUpdateCookies(page, index);
         log('INFO', 'KeepAlive', `Cookies rafraichis pour ${account.email}`);
 
-        // Extraire les statistiques d'utilisation du serveur actif en tâche de fond (dans le contexte browser)
-        const serverId = account.server_id ||
-            (index === LOCAL_STATE.active_account_index ? LOCAL_STATE.current_server_id : null);
-
-        if (serverId && index === LOCAL_STATE.active_account_index) {
-            try {
-                log('INFO', 'KeepAlive', `Recuperation des stats BTP pour le serveur #${serverId}...`);
-                const stats = await page.evaluate(async (urls) => {
-                    async function fetchText(url) {
-                        const response = await fetch(url, { credentials: 'include' });
-                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                        return (await response.text()).trim();
-                    }
-                    const [mem, cpu] = await Promise.all([
-                        fetchText(urls.memory),
-                        fetchText(urls.cpu),
-                    ]);
-                    return { mem, cpu };
-                }, {
-                    memory: URLS.BOXTOPLAY_MEMORY_USAGE(serverId),
-                    cpu: URLS.BOXTOPLAY_CPU_USAGE(serverId),
-                });
-
-                cachedStats.memoryUsage = stats.mem || '0';
-                cachedStats.cpuUsage = stats.cpu || '0';
-                cachedStats.lastUpdated = Date.now();
-                log('INFO', 'KeepAlive', `Stats BTP mis a jour: RAM=${stats.mem}MB, CPU=${stats.cpu}%`);
-            } catch (statsErr) {
-                log('WARN', 'KeepAlive', `Impossible de recuperer les stats BTP: ${statsErr.message}`);
-            }
-        }
     } catch (error) {
         log('ERROR', 'KeepAlive', `Erreur refresh cookies ${account.email}: ${error.message}`);
     } finally {
@@ -1099,37 +1063,29 @@ async function updatePresence() {
         const account = LOCAL_STATE.accounts[activeIndex];
         const serverId = LOCAL_STATE.current_server_id;
 
-        // Nombre de joueurs: l'API BTP ne l'expose pas, on garde mcsrvstat (pas de Cloudflare block)
-        const mcStatus = await fetchMcStatus();
-
-        if (!mcStatus) {
-            throw new Error('Impossible de joindre le serveur (API indisponible)');
-        }
-
-        // Online/offline: via l'API BTP officielle (runtime_status fait foi, cf. rest_ops.py
-        // cote v2), avec repli sur mcsrvstat si la cle API manque ou que l'appel echoue.
-        let isOnline = mcStatus.online;
+        // Tout vient de l'API BTP officielle: runtime_status pour online/offline
+        // (fait foi, cf. rest_ops.py cote v2) + /metrics pour joueurs/ram/cpu
+        // (endpoint documente: https://api.boxtoplay.com/docs#tag/minecraft/GET/services/minecraft/{serverId}/metrics)
         const apiKey = getBtpApiKey(activeIndex);
-        if (apiKey) {
-            try {
-                const apiId = await getCachedBtpApiId(apiKey, serverId);
-                const runtimeStatus = await btpRuntimeStatus(apiKey, apiId);
-                isOnline = runtimeStatus === 'started';
-            } catch (btpErr) {
-                log('WARN', 'Presence', `Statut BTP indisponible, repli mcsrvstat: ${btpErr.message}`);
-            }
+        if (!apiKey) {
+            throw new Error(`Cle API BTP manquante (BTP_API_KEY_${activeIndex})`);
         }
-        const onlinePlayers = mcStatus.players?.online ?? 0;
+        const apiId = await getCachedBtpApiId(apiKey, serverId);
+        const [runtimeStatus, metrics] = await Promise.all([
+            btpRuntimeStatus(apiKey, apiId),
+            btpMetrics(apiKey, apiId),
+        ]);
+        const isOnline = runtimeStatus === 'started';
 
         let statusIcon = '🔴';
         let memoryGo = 0;
         let cpuPercent = 0;
+        const onlinePlayers = metrics?.players_online ?? 0;
 
         if (isOnline) {
             statusIcon = '🟢';
-            // Utiliser les statistiques BTP de RAM/CPU extraites lors du dernier KeepAlive
-            memoryGo = Number(cachedStats.memoryUsage || 0) / 1000;
-            cpuPercent = Number(cachedStats.cpuUsage || 0);
+            memoryGo = Number(metrics?.memory_usage_mb || 0) / 1000;
+            cpuPercent = Number(metrics?.cpu_usage_percent || metrics?.display_cpu_usage_percent || 0);
         }
 
         statusMessage = `${statusIcon} | 👥 ${onlinePlayers} | 🧠 ${memoryGo.toFixed(2)} Go | ⚙️ ${cpuPercent}%`;
