@@ -17,6 +17,7 @@ const URLS = {
     BOXTOPLAY_ONLINE_PLAYERS: (serverId) => `https://www.boxtoplay.com/minecraft/getOnlinePlayers/${serverId}`,
     GITHUB_GIST: (gistId) => `https://api.github.com/gists/${gistId}`,
     GITHUB_ACTION_DISPATCH: (repo) => `https://api.github.com/repos/${repo}/actions/workflows/schedule.yml/dispatches`,
+    GITHUB_ROTATION_RUNS: (repo) => `https://api.github.com/repos/${repo}/actions/workflows/schedule.yml/runs?per_page=5`,
     MC_STATUS: (dns) => `https://api.mcsrvstat.us/3/${dns}.boxtoplay.com`,
 };
 
@@ -1207,26 +1208,27 @@ async function triggerGitHubAction() {
 }
 
 /**
- * Verifie si un workflow GitHub Actions est en cours pour le repo configure
+ * Verifie si une rotation (schedule.yml) est en cours ou en attente.
+ *
+ * Ne lire que les runs de schedule.yml, et plusieurs: le 2026-09-17 un
+ * workflow de test pousse a 11:39Z etait le run le plus recent du depot. Il
+ * masquait la rotation lancee a 11:36Z, toujours en cours, et le bot en a
+ * redeclenche une seconde a 11:56Z. Un run en file (concurrency) peut aussi
+ * en cacher un plus ancien encore en cours.
  */
+const ACTIVE_RUN_STATUSES = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
+
 async function isWorkflowInProgress() {
     try {
-        const response = await axios.get(
-            `https://api.github.com/repos/${GITHUB_REPO}/actions/runs?per_page=1`,
-            {
-                headers: {
-                    Authorization: `token ${GH_TOKEN}`,
-                    Accept: 'application/vnd.github.v3+json',
-                },
-                timeout: 10000,
-            }
-        );
+        const response = await axios.get(URLS.GITHUB_ROTATION_RUNS(GITHUB_REPO), {
+            headers: {
+                Authorization: `token ${GH_TOKEN}`,
+                Accept: 'application/vnd.github.v3+json',
+            },
+            timeout: 10000,
+        });
 
-        if (response.data?.workflow_runs?.length > 0) {
-            const latestRun = response.data.workflow_runs[0];
-            return latestRun.status === 'in_progress' || latestRun.status === 'queued';
-        }
-        return false;
+        return (response.data?.workflow_runs ?? []).some((run) => ACTIVE_RUN_STATUSES.has(run.status));
     } catch (error) {
         log('WARN', 'Workflow', `Erreur verification status: ${error.message}`);
         return false;
